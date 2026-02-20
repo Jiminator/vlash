@@ -14,6 +14,7 @@ Architecture:
 
 """
 
+import logging
 import os
 from collections import deque
 from pathlib import Path
@@ -240,15 +241,29 @@ class GrootModel(nn.Module):
 
         mapped_sd = {}
         for key, value in original_state_dict.items():
-            mapped_sd[key] = value
+            if key.startswith("model."):
+                mapped_sd[key[len("model."):]] = value
+            else:
+                mapped_sd[key] = value
 
         incompatible = model.load_state_dict(mapped_sd, strict=False)
-        if incompatible.unexpected_keys:
-            print(f"[GROOT] Unexpected keys (ignored): {len(incompatible.unexpected_keys)}")
-        if incompatible.missing_keys:
-            print(f"[GROOT] Missing keys: {len(incompatible.missing_keys)}")
-            for k in incompatible.missing_keys[:10]:
+
+        norm_prefixes = ("normalize_inputs.", "normalize_targets.", "unnormalize_outputs.")
+        unexpected_keys = [k for k in incompatible.unexpected_keys
+                          if not k.startswith(norm_prefixes)]
+        if unexpected_keys:
+            print(f"[GROOT] Unexpected keys (ignored): {len(unexpected_keys)}")
+            for k in unexpected_keys[:10]:
                 print(f"  {k}")
+        tied_weight_keys = {"backbone.eagle_model.language_model.model.embed_tokens.weight"}
+        missing_keys = [k for k in incompatible.missing_keys if k not in tied_weight_keys]
+        if missing_keys:
+            raise RuntimeError(
+                f"[GROOT] {len(missing_keys)} missing keys when loading checkpoint "
+                f"from {local_model_path}. First 10:\n"
+                + "\n".join(f"  {k}" for k in missing_keys[:10])
+                + "\nThis likely means the checkpoint format is incompatible."
+            )
 
         return model
 
@@ -332,14 +347,6 @@ class GrootPolicy(PreTrainedPolicy):
         config.base_model_path = pretrained_name_or_path
         dataset_stats = kwargs.pop("dataset_stats", None)
 
-        # Without dataset stats, force identity normalization to avoid shape mismatches
-        if dataset_stats is None:
-            config.normalization_mapping = {
-                "VISUAL": NormalizationMode.IDENTITY,
-                "STATE": NormalizationMode.IDENTITY,
-                "ACTION": NormalizationMode.IDENTITY,
-            }
-
         # Load checkpoint config first — this updates max_action_dim, max_state_dim, etc.
         # We need these values before setting feature shapes.
         pretrained_model = GrootModel.from_pretrained(config, pretrained_name_or_path)
@@ -363,6 +370,12 @@ class GrootPolicy(PreTrainedPolicy):
         instance = cls(config, dataset_stats=dataset_stats)
         instance.model = pretrained_model
 
+        # Load normalization stats from checkpoint. GrootModel.from_pretrained
+        # only loads model weights; normalize/unnormalize stats are saved as
+        # part of the full GrootPolicy state_dict and get discarded there.
+        if dataset_stats is None:
+            cls._load_normalization_stats(instance, pretrained_name_or_path)
+
         if config.use_bf16:
             instance.model.to_bfloat16_for_selected_params("bfloat16")
 
@@ -370,6 +383,50 @@ class GrootPolicy(PreTrainedPolicy):
             instance.to(config.device)
         instance.eval()
         return instance
+
+    @classmethod
+    def _load_normalization_stats(cls, instance, pretrained_name_or_path: str):
+        """Load normalization statistics from a checkpoint into the policy.
+
+        When no dataset_stats are provided, the Normalize/Unnormalize modules
+        are initialized with inf-valued buffers. This method loads the actual
+        stats from the checkpoint file (saved by LeRobot's save_pretrained).
+        """
+        import glob
+        from safetensors.torch import load_file
+
+        try:
+            local_path = snapshot_download(pretrained_name_or_path, repo_type="model")
+        except (HFValidationError, RepositoryNotFoundError):
+            local_path = pretrained_name_or_path
+
+        single_file = os.path.join(local_path, "model.safetensors")
+        if os.path.exists(single_file):
+            sf_files = [single_file]
+        else:
+            sf_files = sorted(glob.glob(os.path.join(local_path, "*.safetensors")))
+
+        if not sf_files:
+            logging.warning("No safetensors files found; normalization stats not loaded")
+            return
+
+        full_sd = {}
+        for sf in sf_files:
+            full_sd.update(load_file(sf))
+
+        norm_prefixes = ("normalize_inputs.", "normalize_targets.", "unnormalize_outputs.")
+        norm_sd = {k: v for k, v in full_sd.items() if k.startswith(norm_prefixes)}
+
+        if not norm_sd:
+            logging.warning(
+                "Checkpoint has no normalization stats. "
+                "Normalization will be identity (no-op)."
+            )
+            return
+
+        incompatible = instance.load_state_dict(norm_sd, strict=False)
+        loaded = len(norm_sd) - len(incompatible.unexpected_keys)
+        logging.info(f"Loaded {loaded} normalization parameters from checkpoint")
 
     def reset(self):
         """Reset action queue. Call when environment resets."""

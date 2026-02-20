@@ -74,6 +74,9 @@ class RunConfig:
     # Task description passed to policy
     single_task: Union[str, None] = None
 
+    # Dry run: run inference and print actions without sending to robot
+    dry_run: bool = False
+
     def __post_init__(self):
         """Parse policy config and validate settings."""
         # Handle policy configuration with CLI override support

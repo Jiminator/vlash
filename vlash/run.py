@@ -293,6 +293,7 @@ def run_loop(
     inference_overlap_steps: int = 0,
     display_data: bool = False,
     control_time_s: int | float = 60,
+    dry_run: bool = False,
 ):
     """Core control loop for real-time robot operation.
     
@@ -310,6 +311,7 @@ def run_loop(
         inference_overlap_steps: Steps of overlap between chunks.
         display_data: Whether to log data to Rerun for visualization.
         control_time_s: Total runtime in seconds.
+        dry_run: If True, skip sending actions to the robot and log them instead.
     """
     # Reset policy state (clears any cached observations)
     if policy is not None:
@@ -329,6 +331,10 @@ def run_loop(
     step_count = 0
     observation_frame = None
     start_time = time.perf_counter()
+    all_actions = [] if dry_run else None
+
+    if dry_run:
+        logging.info("=== DRY RUN MODE: actions will NOT be sent to the robot ===")
 
     # Main control loop
     while time.perf_counter() - start_time < control_time_s:
@@ -351,7 +357,11 @@ def run_loop(
 
         # Send action based on quantization ratio
         if (step_count + 1) % action_quant_ratio == 0:
-            robot.send_action(action)
+            if dry_run:
+                all_actions.append(action)
+                logging.info(f"[DRY RUN] Step {step_count}: {action}")
+            else:
+                robot.send_action(action)
 
             # Optional: log to Rerun for debugging/visualization
             if display_data and observation is not None:
@@ -362,6 +372,23 @@ def run_loop(
             busy_wait(1 / fps - elapsed)
 
         step_count += 1
+
+    if dry_run and all_actions:
+        logging.info(f"=== DRY RUN SUMMARY: {len(all_actions)} actions collected ===")
+        action_keys = list(all_actions[0].keys())
+        header = f"{'step':>6s}  " + "  ".join(f"{k:>14s}" for k in action_keys)
+        logging.info(header)
+        for i, act in enumerate(all_actions):
+            vals = "  ".join(f"{act[k]:>14.6f}" for k in action_keys)
+            logging.info(f"{i:>6d}  {vals}")
+        
+        actions_np = np.array([[act[k] for k in action_keys] for act in all_actions])
+        logging.info(f"--- Action statistics ---")
+        logging.info(f"  Keys: {action_keys}")
+        logging.info(f"  Min:  {actions_np.min(axis=0).tolist()}")
+        logging.info(f"  Max:  {actions_np.max(axis=0).tolist()}")
+        logging.info(f"  Mean: {actions_np.mean(axis=0).tolist()}")
+        logging.info(f"  Std:  {actions_np.std(axis=0).tolist()}")
 
 
 def load_and_compile_policy(cfg: RunConfig) -> PreTrainedPolicy:
@@ -513,6 +540,7 @@ def run(cfg: RunConfig):
             inference_overlap_steps=cfg.inference_overlap_steps,
             display_data=cfg.display_data,
             control_time_s=cfg.control_time_s,
+            dry_run=cfg.dry_run,
         )
     finally:
         # Cleanup: disconnect robot and stop keyboard listener
