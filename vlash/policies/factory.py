@@ -41,6 +41,12 @@ from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.pretrained import PreTrainedPolicy
 
+from vlash.policies.groot.configuration_groot import GrootConfig  # noqa: F401
+
+# Override lerobot's GrootConfig registration with our vlash version
+# (lerobot's GrootConfig lacks compile_model/compile_mode/use_bf16 etc.)
+PreTrainedConfig._choice_registry["groot"] = GrootConfig
+
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """Get policy class by name.
@@ -61,6 +67,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     if name == "pi05":
         from vlash.policies.pi05.modeling_pi05 import PI05Policy
         return PI05Policy
+
+    if name == "groot":
+        from vlash.policies.groot.modeling_groot import GrootPolicy
+        return GrootPolicy
 
     raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
