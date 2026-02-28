@@ -1,16 +1,13 @@
-"""GR00T N1.5 Model Implementation.
+"""GR00T Model Implementation (N1.5 / N1.6).
 
 This module implements the GR00T model for robot control, adapted for the
-VLASH framework. Follows the same preprocessing pattern as PI05:
-  - prepare_images(): GPU resize + normalize (no CPU roundtrip)
-  - prepare_language(): tokenize + insert image tokens (CPU tokenizer, then GPU)
-  - Model forward takes explicit tensor arguments (compile-friendly)
+VLASH framework. Supports both N1.5 (DiT) and N1.6 (AlternateVLDiT) architectures.
 
 Architecture:
     GrootPolicy (wrapper)
     └── GrootModel (core model)
-        ├── EagleBackbone (Eagle2 VLM: SigLIP + Qwen2 → features)
-        └── FlowmatchingActionHead (DiT + flow matching → actions)
+        ├── EagleBackbone (Eagle2 VLM: SigLIP + Qwen3 → features)
+        └── FlowmatchingActionHead (DiT/AlternateVLDiT + flow matching → actions)
 
 """
 
@@ -34,7 +31,12 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from vlash.policies.normalize import Normalize, Unnormalize
 from vlash.policies.groot.configuration_groot import GrootConfig
-from vlash.policies.groot.eagle_backbone import EagleBackbone, DEFAULT_VENDOR_EAGLE_PATH
+from vlash.policies.groot.eagle_backbone import (
+    EagleBackbone,
+    DEFAULT_EAGLE2_PATH,
+    DEFAULT_EAGLE3_PATH,
+    DEFAULT_VENDOR_EAGLE_PATH,
+)
 from vlash.policies.groot.action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
@@ -54,12 +56,10 @@ def _pad_vector(vector: Tensor, new_dim: int) -> Tensor:
 
 
 class GrootModel(nn.Module):
-    """Core GR00T N1.5 model: Eagle backbone + flow matching action head.
+    """Core GR00T model: Eagle backbone + flow matching action head.
 
-    Unlike PI0.5 which uses shared transformer layers between VLM and action
-    expert, GR00T uses a separate DiT that cross-attends to Eagle backbone
-    features. All forward methods take explicit tensor arguments for
-    torch.compile compatibility.
+    Supports both N1.5 (DiT + future_tokens + vl_self_attention) and
+    N1.6 (AlternateVLDiT) architectures, selected via config.
     """
 
     def __init__(self, config: GrootConfig):
@@ -94,9 +94,14 @@ class GrootModel(nn.Module):
             max_state_dim=config.max_state_dim,
             tune_projector=config.tune_projector,
             tune_diffusion_model=config.tune_diffusion_model,
+            tune_vlln=getattr(config, "tune_vlln", True),
             use_vlln=config.use_vlln,
             vl_self_attention_cfg=config.vl_self_attention_cfg,
             num_target_vision_tokens=config.num_target_vision_tokens,
+            use_alternate_vl_dit=config.use_alternate_vl_dit,
+            attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+            state_dropout_prob=config.state_dropout_prob,
+            state_additive_noise_scale=config.state_additive_noise_scale,
         )
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
@@ -109,41 +114,39 @@ class GrootModel(nn.Module):
         return num_images * self.backbone.num_image_token
 
     def forward(self, pixel_values, input_ids, attention_mask, image_flags,
-                state, action, action_mask, embodiment_id,
+                state, action, embodiment_id,
                 num_images: int = 1, img_start: int = 0):
-        """Training forward: compute flow matching loss.
+        """Training forward: compute per-element flow matching loss.
 
-        All arguments are explicit GPU tensors (compile-friendly).
-        num_images and img_start are plain Python ints computed outside the compiled region.
+        Returns per-element MSE [B, T, action_dim].
+        Policy handles masking and reduction.
         """
         num_vit_tokens = self._num_vit_tokens(num_images)
-        backbone_features, backbone_attention_mask = self.backbone(
+        backbone_features, backbone_attention_mask, image_mask = self.backbone(
             pixel_values, input_ids, attention_mask, image_flags,
             num_vit_tokens=num_vit_tokens, img_start=img_start,
         )
-        loss = self.action_head(
+        losses = self.action_head(
             backbone_features, backbone_attention_mask,
-            state, action, action_mask, embodiment_id,
+            state, action, embodiment_id,
+            image_mask=image_mask,
         )
-        return loss
+        return losses
 
     @torch.no_grad()
     def sample_actions(self, pixel_values, input_ids, attention_mask, image_flags,
                        state, embodiment_id,
                        num_images: int = 1, img_start: int = 0):
-        """Inference: generate actions via iterative denoising.
-
-        All arguments are explicit GPU tensors (compile-friendly).
-        num_images and img_start are plain Python ints computed outside the compiled region.
-        """
+        """Inference: generate actions via iterative denoising."""
         num_vit_tokens = self._num_vit_tokens(num_images)
-        backbone_features, backbone_attention_mask = self.backbone(
+        backbone_features, backbone_attention_mask, image_mask = self.backbone(
             pixel_values, input_ids, attention_mask, image_flags,
             num_vit_tokens=num_vit_tokens, img_start=img_start,
         )
         actions = self.action_head.get_action(
             backbone_features, backbone_attention_mask,
             state, embodiment_id,
+            image_mask=image_mask,
         )
         return actions
 
@@ -165,12 +168,23 @@ class GrootModel(nn.Module):
 
     @classmethod
     def from_pretrained(cls, config: GrootConfig, pretrained_path: str):
-        """Load a GrootModel from a pretrained GR00T checkpoint."""
+        """Load a GrootModel from a pretrained GR00T checkpoint.
+
+        Handles both N1.5 (nested backbone_cfg/action_head_cfg) and
+        N1.6 (flat config keys) checkpoint formats.
+        """
         try:
             local_model_path = snapshot_download(pretrained_path, repo_type="model")
         except (HFValidationError, RepositoryNotFoundError):
             print(f"[GROOT] Loading from local path: {pretrained_path}")
             local_model_path = pretrained_path
+
+        user_chunk_size = config.chunk_size
+        user_n_action_steps = config.n_action_steps
+        user_tune_llm = config.tune_llm
+        user_tune_visual = config.tune_visual
+        user_tune_projector = config.tune_projector
+        user_tune_diffusion_model = config.tune_diffusion_model
 
         import json
         config_path = os.path.join(local_model_path, "config.json")
@@ -178,48 +192,20 @@ class GrootModel(nn.Module):
             with open(config_path) as f:
                 checkpoint_config = json.load(f)
 
-            if "backbone_cfg" in checkpoint_config:
-                bb_cfg = checkpoint_config["backbone_cfg"]
-                config.eagle_project_to_dim = bb_cfg.get(
-                    "project_to_dim", config.eagle_project_to_dim)
-                config.eagle_select_layer = bb_cfg.get(
-                    "select_layer", config.eagle_select_layer)
-                config.tune_llm = bb_cfg.get("tune_llm", config.tune_llm)
-                config.tune_visual = bb_cfg.get("tune_visual", config.tune_visual)
+            model_type = checkpoint_config.get("model_type", "")
+            is_n16 = model_type == "Gr00tN1d6"
 
-            if "action_head_cfg" in checkpoint_config:
-                ah_cfg = checkpoint_config["action_head_cfg"]
-                config.diffusion_model_cfg = ah_cfg.get(
-                    "diffusion_model_cfg", config.diffusion_model_cfg)
-                config.vl_self_attention_cfg = ah_cfg.get(
-                    "vl_self_attention_cfg", config.vl_self_attention_cfg)
-                config.action_head_hidden_size = ah_cfg.get(
-                    "hidden_size", config.action_head_hidden_size)
-                config.action_head_input_embedding_dim = ah_cfg.get(
-                    "input_embedding_dim", config.action_head_input_embedding_dim)
-                config.action_head_backbone_embedding_dim = ah_cfg.get(
-                    "backbone_embedding_dim", config.action_head_backbone_embedding_dim)
-                config.max_action_dim = ah_cfg.get(
-                    "action_dim", config.max_action_dim)
-                config.chunk_size = ah_cfg.get(
-                    "action_horizon", config.chunk_size)
-                config.num_inference_steps = ah_cfg.get(
-                    "num_inference_timesteps", config.num_inference_steps)
-                config.max_num_embodiments = ah_cfg.get(
-                    "max_num_embodiments", config.max_num_embodiments)
-                config.max_state_dim = ah_cfg.get(
-                    "max_state_dim", config.max_state_dim)
-                config.add_pos_embed = ah_cfg.get(
-                    "add_pos_embed", config.add_pos_embed)
-                config.use_vlln = ah_cfg.get(
-                    "use_vlln", config.use_vlln)
-                config.num_target_vision_tokens = ah_cfg.get(
-                    "num_target_vision_tokens", config.num_target_vision_tokens)
+            if is_n16:
+                cls._apply_n16_config(config, checkpoint_config)
+            else:
+                cls._apply_n15_config(config, checkpoint_config)
 
-            if "action_horizon" in checkpoint_config:
-                config.chunk_size = checkpoint_config["action_horizon"]
-            if "action_dim" in checkpoint_config:
-                config.max_action_dim = checkpoint_config["action_dim"]
+        config.chunk_size = user_chunk_size
+        config.n_action_steps = user_n_action_steps
+        config.tune_llm = user_tune_llm
+        config.tune_visual = user_tune_visual
+        config.tune_projector = user_tune_projector
+        config.tune_diffusion_model = user_tune_diffusion_model
 
         model = cls(config)
 
@@ -255,27 +241,73 @@ class GrootModel(nn.Module):
             print(f"[GROOT] Unexpected keys (ignored): {len(unexpected_keys)}")
             for k in unexpected_keys[:10]:
                 print(f"  {k}")
-        tied_weight_keys = {"backbone.eagle_model.language_model.model.embed_tokens.weight"}
+
+        tied_weight_keys = {"backbone.model.language_model.model.embed_tokens.weight"}
         missing_keys = [k for k in incompatible.missing_keys if k not in tied_weight_keys]
         if missing_keys:
-            raise RuntimeError(
+            logging.warning(
                 f"[GROOT] {len(missing_keys)} missing keys when loading checkpoint "
                 f"from {local_model_path}. First 10:\n"
                 + "\n".join(f"  {k}" for k in missing_keys[:10])
-                + "\nThis likely means the checkpoint format is incompatible."
             )
 
         return model
 
+    @staticmethod
+    def _apply_n15_config(config: GrootConfig, ckpt: dict):
+        """Apply architecture params from an N1.5 checkpoint (nested format)."""
+        if "backbone_cfg" in ckpt:
+            bb = ckpt["backbone_cfg"]
+            config.eagle_project_to_dim = bb.get("project_to_dim", config.eagle_project_to_dim)
+            config.eagle_select_layer = bb.get("select_layer", config.eagle_select_layer)
+
+        if "action_head_cfg" in ckpt:
+            ah = ckpt["action_head_cfg"]
+            config.diffusion_model_cfg = ah.get("diffusion_model_cfg", config.diffusion_model_cfg)
+            config.vl_self_attention_cfg = ah.get("vl_self_attention_cfg", config.vl_self_attention_cfg)
+            config.action_head_hidden_size = ah.get("hidden_size", config.action_head_hidden_size)
+            config.action_head_input_embedding_dim = ah.get("input_embedding_dim", config.action_head_input_embedding_dim)
+            config.action_head_backbone_embedding_dim = ah.get("backbone_embedding_dim", config.action_head_backbone_embedding_dim)
+            config.max_action_dim = ah.get("action_dim", config.max_action_dim)
+            config.num_inference_steps = ah.get("num_inference_timesteps", config.num_inference_steps)
+            config.max_num_embodiments = ah.get("max_num_embodiments", config.max_num_embodiments)
+            config.max_state_dim = ah.get("max_state_dim", config.max_state_dim)
+            config.add_pos_embed = ah.get("add_pos_embed", config.add_pos_embed)
+            config.use_vlln = ah.get("use_vlln", config.use_vlln)
+            config.num_target_vision_tokens = ah.get("num_target_vision_tokens", config.num_target_vision_tokens)
+            config.use_alternate_vl_dit = False
+
+        if "action_dim" in ckpt:
+            config.max_action_dim = ckpt["action_dim"]
+
+    @staticmethod
+    def _apply_n16_config(config: GrootConfig, ckpt: dict):
+        """Apply architecture params from an N1.6 checkpoint (flat format)."""
+        if config.eagle_path is None:
+            config.eagle_path = DEFAULT_EAGLE3_PATH
+            config.tokenizer_assets_repo = "local/eagle3-processor-groot-n1d6"
+        config.eagle_select_layer = ckpt.get("select_layer", config.eagle_select_layer)
+        config.eagle_project_to_dim = None
+        config.diffusion_model_cfg = ckpt.get("diffusion_model_cfg", config.diffusion_model_cfg)
+        config.action_head_hidden_size = ckpt.get("hidden_size", config.action_head_hidden_size)
+        config.action_head_input_embedding_dim = ckpt.get("input_embedding_dim", config.action_head_input_embedding_dim)
+        config.action_head_backbone_embedding_dim = ckpt.get("backbone_embedding_dim", config.action_head_backbone_embedding_dim)
+        config.max_action_dim = ckpt.get("max_action_dim", config.max_action_dim)
+        config.max_state_dim = ckpt.get("max_state_dim", config.max_state_dim)
+        config.num_inference_steps = ckpt.get("num_inference_timesteps", config.num_inference_steps)
+        config.max_num_embodiments = ckpt.get("max_num_embodiments", config.max_num_embodiments)
+        config.add_pos_embed = ckpt.get("add_pos_embed", config.add_pos_embed)
+        config.use_vlln = ckpt.get("use_vlln", config.use_vlln)
+        config.use_alternate_vl_dit = ckpt.get("use_alternate_vl_dit", True)
+        config.attend_text_every_n_blocks = ckpt.get("attend_text_every_n_blocks", 2)
+        config.num_target_vision_tokens = 0
+        config.vl_self_attention_cfg = None
+        config.state_dropout_prob = ckpt.get("state_dropout_prob", 0.0)
+        config.state_additive_noise_scale = ckpt.get("state_additive_noise_scale", 0.0)
+
 
 class GrootPolicy(PreTrainedPolicy):
-    """GR00T N1.5 Policy wrapper for training and inference.
-
-    Follows the same preprocessing pattern as PI05Policy:
-    - prepare_images(): resize + normalize on GPU (no CPU roundtrip)
-    - prepare_language(): tokenize with Eagle tokenizer (CPU), move to GPU
-    - Model forward takes explicit GPU tensors (compile-friendly)
-    """
+    """GR00T Policy wrapper for training and inference (N1.5 / N1.6)."""
 
     config_class = GrootConfig
     name = "groot"
@@ -284,6 +316,7 @@ class GrootPolicy(PreTrainedPolicy):
         self,
         config: GrootConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        _pretrained_model: GrootModel | None = None,
     ):
         super().__init__(config)
         config.validate_features()
@@ -310,10 +343,11 @@ class GrootPolicy(PreTrainedPolicy):
             stats=dataset_stats,
         )
 
-        # Create model
-        self.model = GrootModel(config)
+        if _pretrained_model is not None:
+            self.model = _pretrained_model
+        else:
+            self.model = GrootModel(config)
 
-        # Load Eagle tokenizer from cache directory
         cache_dir = self.model.backbone.cache_dir
         self.eagle_tokenizer = AutoTokenizer.from_pretrained(
             cache_dir, trust_remote_code=True)
@@ -367,12 +401,8 @@ class GrootPolicy(PreTrainedPolicy):
                     type=FeatureType.ACTION, shape=(config.max_action_dim,)),
             }
 
-        instance = cls(config, dataset_stats=dataset_stats)
-        instance.model = pretrained_model
+        instance = cls(config, dataset_stats=dataset_stats, _pretrained_model=pretrained_model)
 
-        # Load normalization stats from checkpoint. GrootModel.from_pretrained
-        # only loads model weights; normalize/unnormalize stats are saved as
-        # part of the full GrootPolicy state_dict and get discarded there.
         if dataset_stats is None:
             cls._load_normalization_stats(instance, pretrained_name_or_path)
 
@@ -553,10 +583,11 @@ class GrootPolicy(PreTrainedPolicy):
         """Pad action to max_action_dim."""
         return _pad_vector(batch[ACTION], self.config.max_action_dim)
 
-    # Matches GROOT's GrootPackInputsStep.embodiment_mapping
+    # From Isaac-GR00T processing_gr00t_n1d6.py EMBODIMENT_TAG_TO_PROJECTOR_INDEX
     EMBODIMENT_MAPPING = {
-        "new_embodiment": 31, "oxe_droid": 17, "agibot_genie1": 26,
-        "gr1": 24, "so100": 2, "unitree_g1": 3,
+        "oxe_google": 0, "oxe_widowx": 1, "libero_panda": 2,
+        "unitree_g1": 8, "new_embodiment": 10, "robocasa_panda_omron": 13,
+        "oxe_droid": 16, "gr1": 20, "behavior_r1_pro": 24,
     }
 
     def prepare_embodiment_id(self, batch: dict[str, Tensor]) -> Tensor:
@@ -567,29 +598,6 @@ class GrootPolicy(PreTrainedPolicy):
         bsz = batch[OBS_STATE].shape[0]
         device = batch[OBS_STATE].device
         return torch.full((bsz,), emb_id, dtype=torch.long, device=device)
-
-    def prepare_action_mask(self, batch: dict[str, Tensor], action: Tensor) -> Tensor:
-        """Create action mask for loss computation.
-
-        Masks both:
-        - Padded action dimensions (actual_dim..max_action_dim)
-        - Temporally padded steps (beyond episode end)
-        Matches GROOT's GrootPackInputsStep action_mask format.
-        """
-        if "action_mask" in batch:
-            return batch["action_mask"]
-
-        # Mask padded dimensions: only actual action dims contribute to loss
-        actual_action_dim = self.config.output_features[ACTION].shape[0]
-        mask = torch.zeros_like(action)
-        mask[..., :actual_action_dim] = 1.0
-
-        # Mask temporally padded steps
-        actions_is_pad = batch.get("action_is_pad")
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            mask = mask * in_episode_bound.unsqueeze(-1)
-        return mask
 
     def _build_pixel_values_and_flags(
         self, images: list[Tensor], img_masks: list[Tensor],
@@ -619,7 +627,10 @@ class GrootPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> tuple[Tensor, dict[str, Tensor]]:
         """Training forward pass.
 
-        Follows PI05's pattern: prepare inputs → model forward with explicit tensors.
+        Uses the same masked loss as Isaac-GR00T:
+          loss = (MSE * action_mask).sum() / (action_mask.sum() + 1e-6)
+        where action_mask zeros out both temporally padded steps and
+        zero-padded feature dimensions.
         """
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
@@ -629,7 +640,6 @@ class GrootPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         action = self.prepare_action(batch)
         embodiment_id = self.prepare_embodiment_id(batch)
-        action_mask = self.prepare_action_mask(batch, action)
         pixel_values, image_flags = self._build_pixel_values_and_flags(images, img_masks)
         num_images = len(images)
 
@@ -638,13 +648,24 @@ class GrootPolicy(PreTrainedPolicy):
             device_type=device.type, dtype=torch.bfloat16,
             enabled=self.config.use_bf16,
         ):
-            loss = self.model(
+            losses = self.model(
                 pixel_values, input_ids, attention_mask, image_flags,
-                state, action, action_mask, embodiment_id,
+                state, action, embodiment_id,
                 num_images=num_images, img_start=img_start,
             )
 
-        loss_dict = {"loss": loss.item()}
+        # Build action_mask matching Isaac-GR00T:
+        #   1 for valid (action_dim, in-episode) elements, 0 for padding
+        actual_action_dim = self.config.output_features[ACTION].shape[0]
+        action_mask = torch.zeros_like(losses)
+        action_mask[:, :, :actual_action_dim] = 1.0
+
+        actions_is_pad = batch.get("action_is_pad")
+        if actions_is_pad is not None:
+            action_mask = action_mask * (~actions_is_pad).unsqueeze(-1)
+
+        loss = (losses * action_mask).sum() / (action_mask.sum() + 1e-6)
+        loss_dict: dict[str, Tensor | float] = {"loss": loss.item()}
         return loss, loss_dict
 
     @torch.no_grad()

@@ -148,7 +148,9 @@ class BasicTransformerBlock(nn.Module):
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=(
+                encoder_attention_mask if encoder_hidden_states is not None else attention_mask
+            ),
         )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
@@ -263,6 +265,74 @@ class DiT(ModelMixin, ConfigMixin):
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
+                    temb=temb,
+                )
+            all_hidden_states.append(hidden_states)
+
+        conditioning = temb
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        if return_all_hidden_states:
+            return self.proj_out_2(hidden_states), all_hidden_states
+        else:
+            return self.proj_out_2(hidden_states)
+
+
+class AlternateVLDiT(DiT):
+    """DiT variant that alternates cross-attention between image and non-image tokens.
+
+    Even-indexed cross-attention blocks attend to non-image tokens, odd-indexed
+    cross-attention blocks attend to image tokens. Self-attention blocks (odd
+    layers when interleave_self_attention=True) attend to all tokens as usual.
+    """
+
+    def __init__(self, *args, attend_text_every_n_blocks: int = 2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.attend_text_every_n_blocks = attend_text_every_n_blocks
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        return_all_hidden_states: bool = False,
+        image_mask: torch.Tensor | None = None,
+        backbone_attention_mask: torch.Tensor | None = None,
+    ):
+        assert image_mask is not None, "image_mask is required for AlternateVLDiT"
+
+        temb = self.timestep_encoder(timestep)
+
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+
+        image_attention_mask = image_mask & backbone_attention_mask
+        non_image_attention_mask = (~image_mask) & backbone_attention_mask
+
+        all_hidden_states = [hidden_states]
+        assert self.config.interleave_self_attention, "interleave_self_attention must be enabled"
+
+        for idx, block in enumerate(self.transformer_blocks):
+            if idx % 2 == 1:
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=None,
+                    encoder_hidden_states=None,
+                    encoder_attention_mask=None,
+                    temb=temb,
+                )
+            else:
+                if idx % (2 * self.attend_text_every_n_blocks) == 0:
+                    curr_encoder_attention_mask = non_image_attention_mask
+                else:
+                    curr_encoder_attention_mask = image_attention_mask
+
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=None,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
                 )
             all_hidden_states.append(hidden_states)

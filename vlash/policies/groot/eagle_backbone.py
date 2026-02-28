@@ -1,7 +1,7 @@
-"""Eagle2 VLM backbone for GR00T.
+"""Eagle VLM backbone for GR00T (Eagle2 for N1.5, Eagle3 for N1.6).
 
 Ported from Isaac-GR00T / lerobot. The Eagle backbone processes images
-and language together via the Eagle2 vision-language model (SigLIP + Qwen3),
+and language together via the Eagle VLM (SigLIP/SigLIP2 + Qwen3),
 then projects hidden states to the action head's expected dimension.
 
 The forward method takes explicit tensor arguments (PI05-style) to be
@@ -20,13 +20,17 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig, AutoModel
 
 from vlash.layers.attention import Attention
 from vlash.layers.rope import apply_rotary_emb
 
-DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
+_GROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_EAGLE2_PATH = str((_GROOT_DIR / "eagle2_hg_model").resolve())
+DEFAULT_EAGLE3_PATH = str((_GROOT_DIR / "eagle3_hg_model").resolve())
+DEFAULT_VENDOR_EAGLE_PATH = DEFAULT_EAGLE2_PATH
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 HF_LEROBOT_HOME = Path.home() / ".cache" / "lerobot"
 
@@ -126,9 +130,12 @@ class VlashQwen3Attention(nn.Module):
 
 
 class VlashSiglipAttention(nn.Module):
-    """Drop-in replacement for SiglipAttention using vlash's compile-friendly attention.
+    """Drop-in replacement for SiglipAttention / Siglip2Attention.
 
-    SigLIP uses learned position embeddings (no RoPE) and standard MHA (no GQA).
+    Works for both SigLIP (Eagle2/N1.5) and SigLIP2 (Eagle3/N1.6).
+    SigLIP2's extra arguments (rope_freqs_cis, win_meta_list, windows_attn)
+    are accepted via **kwargs but ignored since N1.6 config sets
+    use_rope=false and use_windows_attn=false.
     """
 
     def __init__(self, original_attn: nn.Module):
@@ -148,6 +155,7 @@ class VlashSiglipAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, seq_len, _ = hidden_states.shape
 
@@ -206,7 +214,7 @@ class EagleBackbone(nn.Module):
             config.text_config._attn_implementation = "eager"
         if hasattr(config, "vision_config"):
             config.vision_config._attn_implementation = "eager"
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        self.model = AutoModel.from_config(config, trust_remote_code=True)
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
@@ -216,9 +224,9 @@ class EagleBackbone(nn.Module):
         # Remove layers beyond select_layer to save compute.
         # Negative indices are resolved relative to the current layer count.
         if select_layer < 0:
-            select_layer = len(self.eagle_model.language_model.model.layers) + select_layer + 1
-        while len(self.eagle_model.language_model.model.layers) > select_layer:
-            self.eagle_model.language_model.model.layers.pop(-1)
+            select_layer = len(self.model.language_model.model.layers) + select_layer + 1
+        while len(self.model.language_model.model.layers) > select_layer:
+            self.model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
 
@@ -227,31 +235,43 @@ class EagleBackbone(nn.Module):
 
         self.set_trainable_parameters(tune_llm, tune_visual)
 
-        # Expose Eagle model properties for preprocessing
-        eagle_cfg = self.eagle_model.config
-        image_size = eagle_cfg.force_image_size or eagle_cfg.vision_config.image_size
-        patch_size = eagle_cfg.vision_config.patch_size
+        eagle_cfg = self.model.config
+        vision_cfg = eagle_cfg.vision_config
+        self._is_siglip2 = getattr(vision_cfg, "model_type", "") == "siglip2_vision_model"
+        patch_size = vision_cfg.patch_size
+        self._patch_size = patch_size
         downsample_ratio = eagle_cfg.downsample_ratio
+
+        # Eagle2 has force_image_size; Eagle3 computes from num_patches * patch_size
+        if hasattr(eagle_cfg, "force_image_size") and eagle_cfg.force_image_size:
+            image_size = eagle_cfg.force_image_size
+        elif hasattr(vision_cfg, "image_size") and vision_cfg.image_size:
+            image_size = vision_cfg.image_size
+        else:
+            num_patches = getattr(vision_cfg, "num_patches", 256)
+            image_size = int(num_patches ** 0.5) * patch_size
+
         if eagle_cfg.use_pixel_shuffle:
             self._num_image_token = int((image_size // patch_size) ** 2 * (downsample_ratio ** 2))
         else:
             self._num_image_token = int((image_size // patch_size) ** 2)
         self._image_token_index = eagle_cfg.image_token_index
         self._eagle_image_size = image_size
+        self._grid_size = image_size // patch_size
         self._cache_dir = str(cache_dir)
 
     def _replace_attention_with_vlash(self):
         """Replace all attention modules with vlash's compile-friendly versions.
 
-        Walks both the Qwen3 LLM decoder layers and SigLIP vision encoder layers,
-        swapping each self_attn module with the corresponding vlash wrapper.
+        Walks the Qwen3 LLM decoder layers and SigLIP/SigLIP2 vision encoder
+        layers, swapping each self_attn module with the corresponding vlash wrapper.
+        Works for both Eagle2 (N1.5) and Eagle3 (N1.6).
         """
-        # Qwen3 LLM layers
-        for layer in self.eagle_model.language_model.model.layers:
+        for layer in self.model.language_model.model.layers:
             layer.self_attn = VlashQwen3Attention(layer.self_attn)
 
-        # SigLIP vision encoder layers (path: vision_model.vision_model.encoder.layers)
-        siglip_encoder = self.eagle_model.vision_model.vision_model.encoder
+        # Both Eagle2 and Eagle3 share the same path to encoder layers
+        siglip_encoder = self.model.vision_model.vision_model.encoder
         for layer in siglip_encoder.layers:
             layer.self_attn = VlashSiglipAttention(layer.self_attn)
 
@@ -277,17 +297,18 @@ class EagleBackbone(nn.Module):
         for p in self.parameters():
             p.requires_grad = True
         if not tune_llm:
-            self.eagle_model.language_model.requires_grad_(False)
+            self.model.language_model.requires_grad_(False)
         if not tune_visual:
-            self.eagle_model.vision_model.requires_grad_(False)
-            self.eagle_model.mlp1.requires_grad_(False)
+            self.model.vision_model.requires_grad_(False)
+            self.model.mlp1.requires_grad_(False)
 
     def set_frozen_modules_to_eval_mode(self):
         if self.training:
-            if self.eagle_model.language_model and not self.tune_llm:
-                self.eagle_model.language_model.eval()
-            if self.eagle_model.vision_model and not self.tune_visual:
-                self.eagle_model.vision_model.eval()
+            if self.model.language_model and not self.tune_llm:
+                self.model.language_model.eval()
+            if self.model.vision_model and not self.tune_visual:
+                self.model.vision_model.eval()
+                self.model.mlp1.eval()
 
     def forward(
         self,
@@ -297,7 +318,7 @@ class EagleBackbone(nn.Module):
         image_flags: torch.Tensor,
         num_vit_tokens: int = 0,
         img_start: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run Eagle VLM and project features.
 
         Inlines the Eagle model forward to avoid graph breaks from:
@@ -317,22 +338,24 @@ class EagleBackbone(nn.Module):
                 Both computed outside the compiled region to avoid graph breaks.
 
         Returns:
-            features: Projected backbone features [B, seq_len, project_to_dim].
-            attention_mask: Passed through [B, seq_len].
+            features: Backbone features [B, seq_len, dim].
+            attention_mask: Boolean attention mask [B, seq_len].
+            image_mask: Boolean mask indicating image token positions [B, seq_len].
         """
         self.set_frozen_modules_to_eval_mode()
 
-        eagle = self.eagle_model
+        eagle = self.model
 
         # 1. Embed text tokens
         input_embeds = eagle.language_model.get_input_embeddings()(input_ids)
 
-        # 2. Extract vision features (SigLIP + pixel_shuffle + MLP projection)
-        vit_embeds = eagle.extract_feature(pixel_values)
+        # 2. Extract vision features
+        if self._is_siglip2:
+            vit_embeds = self._extract_siglip2_features(eagle, pixel_values)
+        else:
+            vit_embeds = eagle.extract_feature(pixel_values)
 
         # 3. Replace image token positions with vision embeddings.
-        # img_start and num_vit_tokens are plain ints matching GROOT's chat
-        # template format (image tokens after prefix, not at position 0).
         b, n, c = input_embeds.shape
         vit_flat = vit_embeds.reshape(b, num_vit_tokens, c)
         input_embeds = input_embeds.clone()
@@ -357,4 +380,67 @@ class EagleBackbone(nn.Module):
                     dummy_term = dummy_term + 0.0 * param.sum()
             eagle_features = eagle_features + dummy_term
 
-        return eagle_features, attention_mask
+        image_mask = input_ids == self._image_token_index
+        backbone_attention_mask = attention_mask == 1
+
+        return eagle_features, backbone_attention_mask, image_mask
+
+    def _extract_siglip2_features(self, eagle: nn.Module, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Inline SigLIP2 vision feature extraction (compile-safe).
+
+        Bypasses SigLIP2's Python-heavy windowing/dynamic-shape code with
+        fixed-shape tensor ops. Only valid for dynamic_image_size=false
+        (fixed resolution, single tile per image).
+
+        Pipeline: patchify → embed → pos_embed → encoder → post_ln → pixel_unshuffle → mlp1
+        """
+        vision = eagle.vision_model.vision_model
+        B = pixel_values.shape[0]
+        ps = self._patch_size
+        grid = self._grid_size  # patches per side
+        num_patches = grid * grid
+        C_vit = vision.embeddings.embed_dim  # 1152
+
+        # 1. Patchify: [B, 3, H, W] → [B*num_patches, ps*ps*3]
+        pv = pixel_values.reshape(B, 3, grid, ps, grid, ps)
+        pv = pv.permute(0, 2, 4, 3, 5, 1)  # [B, grid, grid, ps, ps, 3]
+        pv = pv.reshape(B * num_patches, ps * ps * 3)
+
+        # 2. Patch embedding (Linear): [B*num_patches, 588] → [B*num_patches, 1152]
+        target_dtype = vision.embeddings.patch_embedding.weight.dtype
+        patch_embeds = vision.embeddings.patch_embedding(pv.to(dtype=target_dtype))
+
+        # 3. Add position embedding (no interpolation for fixed size)
+        patch_embeds = patch_embeds.reshape(B, num_patches, C_vit)
+        pos_emb = vision.embeddings.position_embedding.weight[:num_patches].unsqueeze(0)
+        hidden_states = patch_embeds + pos_emb
+
+        # 4. Run encoder layers (vlash attention, no windowing)
+        for layer in vision.encoder.layers:
+            residual = hidden_states
+            hidden_states = layer.layer_norm1(hidden_states)
+            hidden_states, _ = layer.self_attn(hidden_states=hidden_states)
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = layer.layer_norm2(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        # 5. Post layer norm
+        hidden_states = vision.post_layernorm(hidden_states)
+
+        # 6. Pixel unshuffle: [B, 256, 1152] → [B, 1152, 16, 16] → [B, 4608, 8, 8] → [B, 64, 4608]
+        ds = int(1 / eagle.downsample_ratio)  # 2
+        hidden_states = hidden_states.transpose(1, 2).reshape(B, C_vit, grid, grid)
+        hidden_states = F.pixel_unshuffle(hidden_states, downscale_factor=ds)
+        C_out = C_vit * ds * ds  # 4608
+        hidden_states = hidden_states.flatten(start_dim=2).transpose(1, 2)  # [B, 64, 4608]
+
+        # 7. MLP1 connector
+        hidden_states = eagle.mlp1(hidden_states)  # [B, 64, 2048]
+
+        # Flatten to match extract_feature output format: [B*64, 2048]
+        hidden_states = hidden_states.reshape(B * hidden_states.shape[1], -1)
+
+        return hidden_states

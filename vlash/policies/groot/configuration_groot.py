@@ -1,7 +1,7 @@
-"""GR00T N1.5 Policy Configuration.
+"""GR00T Policy Configuration (N1.5 / N1.6).
 
 Configuration for the GR00T (Generalist Robot 0-to-0 Transfer) model
-adapted for the VLASH framework. Follows the same pattern as PI05Config.
+adapted for the VLASH framework. Defaults are set for N1.6 (nvidia/GR00T-N1.6-3B).
 """
 
 from __future__ import annotations
@@ -16,39 +16,34 @@ from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 @dataclass
 class GrootConfig(PreTrainedConfig):
-    """Main configuration for GR00T N1.5 policy.
+    """Configuration for GR00T policy (N1.5 / N1.6).
 
-    Architecture:
-        GrootPolicy (wrapper)
-        └── GrootModel (core model)
-            ├── EagleBackbone (Eagle2 VLM)
-            └── FlowmatchingActionHead
-                ├── DiT (cross-attention diffusion transformer)
-                ├── MultiEmbodimentActionEncoder
-                └── CategorySpecificMLP (state/action encoders)
+    Defaults are set for N1.6 (nvidia/GR00T-N1.6-3B). For N1.5, the
+    from_pretrained method auto-detects and overrides architecture params.
     """
 
     # === Model Source ===
-    base_model_path: str = "nvidia/GR00T-N1.5-3B"
+    base_model_path: str = "nvidia/GR00T-N1.6-3B"
     eagle_path: str | None = None
     tokenizer_assets_repo: str = "lerobot/eagle2hg-processor-groot-n1p5"
 
-    # === Eagle Backbone (defaults match nvidia/GR00T-N1.5-3B checkpoint) ===
+    # === Eagle Backbone ===
     tune_llm: bool = False
-    tune_visual: bool = True
-    eagle_select_layer: int = 12
+    tune_visual: bool = False
+    eagle_select_layer: int = 16
     eagle_project_to_dim: int | None = None
 
     # === Action Head ===
     tune_projector: bool = True
     tune_diffusion_model: bool = True
+    tune_vlln: bool = True
 
     # === Action Prediction ===
     n_obs_steps: int = 1
-    chunk_size: int = 16
-    n_action_steps: int = 16
-    max_state_dim: int = 64
-    max_action_dim: int = 32
+    chunk_size: int = 50
+    n_action_steps: int = 50
+    max_state_dim: int = 128
+    max_action_dim: int = 128
 
     # === Flow Matching ===
     noise_beta_alpha: float = 1.5
@@ -61,20 +56,31 @@ class GrootConfig(PreTrainedConfig):
     max_num_embodiments: int = 32
     embodiment_tag: str = "new_embodiment"
 
-    # === DiT Architecture (defaults match nvidia/GR00T-N1.5-3B checkpoint) ===
+    # === DiT Architecture (defaults match N1.6) ===
     action_head_hidden_size: int = 1024
     action_head_input_embedding_dim: int = 1536
     action_head_backbone_embedding_dim: int = 2048
     add_pos_embed: bool = True
     max_seq_len: int = 1024
-    num_target_vision_tokens: int = 32
     use_vlln: bool = True
+
+    # N1.6: AlternateVLDiT with 32 layers
+    use_alternate_vl_dit: bool = True
+    attend_text_every_n_blocks: int = 2
+
+    # N1.5-only: future_tokens and vl_self_attention (disabled for N1.6)
+    num_target_vision_tokens: int = 0
+    vl_self_attention_cfg: dict | None = None
+
+    # State augmentation
+    state_dropout_prob: float = 0.0
+    state_additive_noise_scale: float = 0.0
 
     diffusion_model_cfg: dict = field(default_factory=lambda: {
         "num_attention_heads": 32,
         "attention_head_dim": 48,
         "output_dim": 1024,
-        "num_layers": 16,
+        "num_layers": 32,
         "dropout": 0.2,
         "attention_bias": True,
         "activation_fn": "gelu-approximate",
@@ -85,24 +91,9 @@ class GrootConfig(PreTrainedConfig):
         "final_dropout": True,
         "positional_embeddings": None,
         "interleave_self_attention": True,
-        "cross_attention_dim": 2048,
-    })
-
-    vl_self_attention_cfg: dict = field(default_factory=lambda: {
-        "num_attention_heads": 32,
-        "attention_head_dim": 64,
-        "output_dim": 2048,
-        "num_layers": 4,
-        "dropout": 0.2,
-        "attention_bias": True,
-        "activation_fn": "gelu-approximate",
-        "max_num_positional_embeddings": 2048,
-        "final_dropout": True,
-        "positional_embeddings": None,
     })
 
     # === Image Processing ===
-    # Eagle vision tower size (auto-detected from model, but can be overridden)
     image_size: tuple[int, int] = (448, 448)
 
     # === Tokenization ===
