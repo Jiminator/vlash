@@ -3,20 +3,20 @@
 # Robot configuration
 robot:
   type: so101_follower
-  port: /dev/ttyACM2  # Update to match your robot's port
-  id: my_awesome_follower_arm
+  port: /dev/ttyACM0
+  id: so101_follower
   cameras:
-    wrist:
+    front:
       type: opencv
-      index_or_path: 0  # Update to match your camera
-      width: 640
-      height: 480
+      index_or_path: /dev/video2
+      width: 1280
+      height: 720
       fps: 30
 
 # Policy configuration
 policy:
 # Fill in the path to the policy checkpoint
-  path: <path to the policy checkpoint>
+  path: Jiminator/vlash_sync_pi05_test_wood_black_random_50
   n_action_steps: 32
   compile_model: true
   device: cuda
@@ -24,7 +24,7 @@ policy:
   fuse_gate_up: true
 
 # Task description passed to the policy
-single_task: <task description>
+single_task: "Pick up white and cyan cube and put in wooden crate"
 
 # Control parameters
 fps: 30  # Control loop frequency (Hz)
