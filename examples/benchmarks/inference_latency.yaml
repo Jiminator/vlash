@@ -19,7 +19,7 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: lerobot/pusht # Change to your dataset
+  repo_id: Jiminator/record-test_wood_black_random_50 # Change to your dataset
   streaming: false
 
 
