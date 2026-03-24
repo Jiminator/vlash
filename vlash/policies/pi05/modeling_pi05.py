@@ -1304,7 +1304,7 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
 
-        lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=False)
+        lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=self.config.compile_model)
 
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise
