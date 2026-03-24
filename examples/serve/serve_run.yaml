@@ -3,7 +3,7 @@
 # Policy configuration
 policy:
 # Fill in the path to the policy checkpoint
-  path: <path to the policy checkpoint>
+  path: Jiminator/record-test_wood_black_random_50
   n_action_steps: 32  # Actions executed per inference
   compile_model: true
   device: cuda
@@ -11,6 +11,6 @@ policy:
   fuse_gate_up: true
 
 # Server configuration
-port: 50051
+port: 8080
 max_workers: 4
 max_message_size: 4194304  # 4 MB
