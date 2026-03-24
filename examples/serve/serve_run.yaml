@@ -3,12 +3,14 @@
 # Policy configuration
 policy:
 # Fill in the path to the policy checkpoint
-  path: Jiminator/vlash_sync_pi05_test_wood_black_random_50
-  n_action_steps: 32  # Actions executed per inference
+  path: Jiminator/vlash_async_pi05_test_wood_black_random_50
+  n_action_steps: 50  # Actions executed per inference
   compile_model: true
+  compile_mode: reduce-overhead
   device: cuda
   fuse_qkv: true
   fuse_gate_up: true
+  dtype: bfloat16
 
 # Server configuration
 port: 8080
