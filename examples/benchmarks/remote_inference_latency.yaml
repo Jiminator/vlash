@@ -19,7 +19,7 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: lerobot/pusht # Change to your dataset
+  repo_id: Jiminator/record-test_wood_black_random_50  # Change to your dataset
   streaming: false
 
 
@@ -45,7 +45,7 @@ remote_inference:
   # Server address (format: "host:port")
   # Use "localhost:50051" for local testing
   # Use actual IP for remote server, e.g., "192.168.1.100:50051"
-  server_address: <YOUR_SERVER_IP>:<YOUR_SERVER_PORT>
+  server_address: 149.165.169.91:8080
   
   # Maximum message size for gRPC (bytes)
   # Increase if working with high-resolution images or large observations
