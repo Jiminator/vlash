@@ -8,6 +8,7 @@ policy:
   
   # Enable torch.compile for optimized inference
   compile_model: true
+  compile_mode: reduce-overhead
   
   # Enable attention/MLP fusion for faster inference
   fuse_qkv: true
