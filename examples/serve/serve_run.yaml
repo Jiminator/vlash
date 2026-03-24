@@ -3,7 +3,7 @@
 # Policy configuration
 policy:
 # Fill in the path to the policy checkpoint
-  path: Jiminator/record-test_wood_black_random_50
+  path: Jiminator/vlash_sync_pi05_test_wood_black_random_50
   n_action_steps: 32  # Actions executed per inference
   compile_model: true
   device: cuda
